@@ -26,6 +26,17 @@ class CIR_I64EnumAttr<string name, string summary, list<I64EnumAttrCase> cases>
   let cppNamespace = "::cir";
 }
 
+class CIR_I32BitEnumAttr<string name, string summary,
+                         list<BitEnumCaseBase> cases>
+    : I32BitEnumAttr<name, summary, cases> {
+  let cppNamespace = "::cir";
+}
+
+// Upstream `EnumAttr` defaults to a bare `$value`, so a standalone attribute
+// falls back to the generic `#cir<cleanup all>` form. Keeping the `<` `>`
+// delimiters gets the dialect's own `#cir.cleanup<all>` instead. Operations
+// that want the bare keyword wrap the argument in the `enum` directive, as in
+// `enum($cleanupKind)`. Naming the argument directly prints `<all>`.
 class CIR_EnumAttr<EnumAttrInfo info, string name = "", list<Trait> traits = []>
     : EnumAttr<CIR_Dialect, info, name, traits> {
   let assemblyFormat = "`<` $value `>`";

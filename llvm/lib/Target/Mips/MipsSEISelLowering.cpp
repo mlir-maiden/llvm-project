@@ -15,7 +15,6 @@
 #include "MipsRegisterInfo.h"
 #include "MipsSubtarget.h"
 #include "llvm/ADT/APInt.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/ISDOpcodes.h"
@@ -393,7 +392,7 @@ addMSAIntType(MVT::SimpleValueType Ty, const TargetRegisterClass *RC) {
   setOperationAction(ISD::EXTRACT_VECTOR_ELT, Ty, Custom);
   setOperationAction(ISD::INSERT_VECTOR_ELT, Ty, Legal);
   setOperationAction(ISD::BUILD_VECTOR, Ty, Custom);
-  setOperationAction(ISD::UNDEF, Ty, Legal);
+  setOperationAction({ISD::UNDEF, ISD::POISON}, Ty, Legal);
 
   setOperationAction(ISD::ADD, Ty, Legal);
   setOperationAction(ISD::AND, Ty, Legal);
@@ -447,6 +446,7 @@ addMSAFloatType(MVT::SimpleValueType Ty, const TargetRegisterClass *RC) {
   setOperationAction(ISD::EXTRACT_VECTOR_ELT, Ty, Legal);
   setOperationAction(ISD::INSERT_VECTOR_ELT, Ty, Legal);
   setOperationAction(ISD::BUILD_VECTOR, Ty, Custom);
+  setOperationAction(ISD::UNDEF, Ty, Legal);
 
   if (Ty != MVT::v8f16) {
     setOperationAction(ISD::FABS,  Ty, Legal);
@@ -2001,9 +2001,8 @@ SDValue MipsSETargetLowering::lowerINTRINSIC_WO_CHAIN(SDValue Op,
                        Op->getOperand(2));
   case Intrinsic::mips_fadd_w:
   case Intrinsic::mips_fadd_d:
-    // TODO: If intrinsics have fast-math-flags, propagate them.
     return DAG.getNode(ISD::FADD, DL, Op->getValueType(0), Op->getOperand(1),
-                       Op->getOperand(2));
+                       Op->getOperand(2), Op->getFlags());
   // Don't lower mips_fcaf_[wd] since LLVM folds SETFALSE condcodes away
   case Intrinsic::mips_fceq_w:
   case Intrinsic::mips_fceq_d:
@@ -2087,9 +2086,8 @@ SDValue MipsSETargetLowering::lowerINTRINSIC_WO_CHAIN(SDValue Op,
                        Op->getOperand(1), Op->getOperand(2), Op->getOperand(3));
   case Intrinsic::mips_fmul_w:
   case Intrinsic::mips_fmul_d:
-    // TODO: If intrinsics have fast-math-flags, propagate them.
     return DAG.getNode(ISD::FMUL, DL, Op->getValueType(0), Op->getOperand(1),
-                       Op->getOperand(2));
+                       Op->getOperand(2), Op->getFlags());
   case Intrinsic::mips_fmsub_w:
   case Intrinsic::mips_fmsub_d: {
     // TODO: If intrinsics have fast-math-flags, propagate them.
@@ -2104,9 +2102,8 @@ SDValue MipsSETargetLowering::lowerINTRINSIC_WO_CHAIN(SDValue Op,
     return DAG.getNode(ISD::FSQRT, DL, Op->getValueType(0), Op->getOperand(1));
   case Intrinsic::mips_fsub_w:
   case Intrinsic::mips_fsub_d:
-    // TODO: If intrinsics have fast-math-flags, propagate them.
     return DAG.getNode(ISD::FSUB, DL, Op->getValueType(0), Op->getOperand(1),
-                       Op->getOperand(2));
+                       Op->getOperand(2), Op->getFlags());
   case Intrinsic::mips_ftrunc_u_w:
   case Intrinsic::mips_ftrunc_u_d:
     return DAG.getNode(ISD::FP_TO_UINT, DL, Op->getValueType(0),
@@ -3133,11 +3130,8 @@ static SDValue lowerVECTOR_SHUFFLE_VSHF(SDValue Op, EVT ResTy,
   SDLoc DL(Op);
   int ResTyNumElts = ResTy.getVectorNumElements();
 
-  assert(Indices[0] >= 0 &&
-         "shuffle mask starts with an UNDEF, which is not expected");
-
   for (int i = 0; i < ResTyNumElts; ++i) {
-    // Idx == -1 means UNDEF
+    // Idx == -1 means UNDEF/poison
     int Idx = Indices[i];
 
     if (0 <= Idx && Idx < ResTyNumElts)
@@ -3145,12 +3139,22 @@ static SDValue lowerVECTOR_SHUFFLE_VSHF(SDValue Op, EVT ResTy,
     if (ResTyNumElts <= Idx && Idx < ResTyNumElts * 2)
       Using2ndVec = true;
   }
-  int LastValidIndex = 0;
+
+  // Find the first non-undef index. This index is used as a default when there
+  // is a leading UNDEF/poison.
+  int SplatIndex = 0;
+  for (int Idx : Indices)
+    if (Idx >= 0) {
+      SplatIndex = Idx;
+      break;
+    }
+
+  int LastValidIndex = SplatIndex;
   for (size_t i = 0; i < Indices.size(); i++) {
     int Idx = Indices[i];
     if (Idx < 0) {
       // Continue using splati index or use the last valid index.
-      Idx = isSPLATI ? Indices[0] : LastValidIndex;
+      Idx = isSPLATI ? SplatIndex : LastValidIndex;
     } else {
       LastValidIndex = Idx;
     }

@@ -16,9 +16,45 @@
 #include "clang/Basic/TargetBuiltins.h"
 #include "clang/CIR/Dialect/IR/CIRDataLayout.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "llvm/Support/NVPTXAddrSpace.h"
 
 using namespace clang;
 using namespace clang::CIRGen;
+
+static mlir::Value makeLdu(CIRGenFunction &cgf, const CallExpr *expr,
+                           llvm::StringRef intrinsicName) {
+  auto &builder = cgf.getBuilder();
+  Address ptr = cgf.emitPointerWithAlignment(expr->getArg(0));
+  QualType argType = expr->getArg(0)->getType();
+  mlir::Type elemTy = cgf.convertTypeForMem(argType->getPointeeType());
+  clang::CharUnits align = ptr.getAlignment();
+  mlir::Location loc = cgf.getLoc(expr->getExprLoc());
+  mlir::Value alignVal =
+      builder.getConstantInt(loc, builder.getSInt32Ty(), align.getQuantity());
+  return cir::LLVMIntrinsicCallOp::create(
+             builder, loc, builder.getStringAttr(intrinsicName), elemTy,
+             {ptr.emitRawPointer(), alignVal})
+      .getResult();
+}
+
+static mlir::Value makeLdg(CIRGenFunction &cgf, const CallExpr *expr) {
+  auto &builder = cgf.getBuilder();
+  Address ptr = cgf.emitPointerWithAlignment(expr->getArg(0));
+  QualType argType = expr->getArg(0)->getType();
+  mlir::Type elemTy = cgf.convertTypeForMem(argType->getPointeeType());
+  mlir::Location loc = cgf.getLoc(expr->getExprLoc());
+
+  // Use addrspace(1) for NVPTX ADDRESS_SPACE_GLOBAL.
+  mlir::Type globalPtrTy = cir::PointerType::get(
+      elemTy, cir::TargetAddressSpaceAttr::get(
+                  builder.getContext(), llvm::NVPTXAS::ADDRESS_SPACE_GLOBAL));
+  mlir::Value asc =
+      builder.createAddrSpaceCast(loc, ptr.getPointer(), globalPtrTy);
+  cir::LoadOp load =
+      builder.createAlignedLoad(loc, elemTy, asc, ptr.getAlignment());
+  load.setInvariant(true);
+  return load.getResult();
+}
 
 /// Emit a CIR LLVMIntrinsicCallOp for a unary NVVM intrinsic.
 /// The result type is inferred from the single argument.
@@ -33,104 +69,142 @@ static mlir::Value emitUnaryNVVMIntrinsic(CIRGenFunction &cgf,
       .getResult();
 }
 
+static mlir::Value emitBar0Reduction(CIRGenFunction &cgf, const CallExpr *expr,
+                                     llvm::StringRef intrinsicName,
+                                     bool returnsPred) {
+  CIRGenBuilderTy &builder = cgf.getBuilder();
+  mlir::Location loc = cgf.getLoc(expr->getExprLoc());
+  mlir::Type si32Ty = builder.getSInt32Ty();
+  mlir::Value zero = builder.getNullValue(si32Ty, loc);
+  mlir::Value pred = builder.createCompare(
+      loc, cir::CmpOpKind::ne, cgf.emitScalarExpr(expr->getArg(0)), zero);
+  mlir::Type resultTy = returnsPred ? mlir::Type(builder.getBoolTy()) : si32Ty;
+  mlir::Value result = builder.emitIntrinsicCallOp(
+      loc, intrinsicName, resultTy, mlir::ValueRange{zero, pred});
+  if (returnsPred)
+    result = builder.createBoolToInt(result, si32Ty);
+  return result;
+}
+
+static mlir::Value makeScopedAtomicRMW(CIRGenFunction &cgf,
+                                       const CallExpr *expr,
+                                       cir::AtomicFetchKind kind,
+                                       cir::SyncScopeKind scope) {
+  auto &builder = cgf.getBuilder();
+  Address destAddr = cgf.emitPointerWithAlignment(expr->getArg(0));
+  mlir::Value destValue = destAddr.emitRawPointer();
+  mlir::Value val = cgf.emitScalarExpr(expr->getArg(1));
+  auto rmwi = cir::AtomicFetchOp::create(
+      builder, cgf.getLoc(expr->getSourceRange()), destValue, val, kind,
+      cir::MemOrder::Relaxed, scope, /*is_volatile=*/false,
+      /*fetch_first=*/true);
+  return rmwi->getResult(0);
+}
+
+static mlir::Value makeScopedAtomicXchg(CIRGenFunction &cgf,
+                                        const CallExpr *expr,
+                                        cir::SyncScopeKind scope) {
+  auto &builder = cgf.getBuilder();
+  Address destAddr = cgf.emitPointerWithAlignment(expr->getArg(0));
+  mlir::Value destValue = destAddr.emitRawPointer();
+  mlir::Value val = cgf.emitScalarExpr(expr->getArg(1));
+  auto xchg = cir::AtomicXchgOp::create(
+      builder, cgf.getLoc(expr->getSourceRange()), destValue, val,
+      cir::MemOrder::Relaxed, scope, /*is_volatile=*/false);
+  return xchg.getResult();
+}
+
 std::optional<mlir::Value>
 CIRGenFunction::emitNVPTXBuiltinExpr(unsigned builtinId, const CallExpr *expr) {
   switch (builtinId) {
   case NVPTX::BI__nvvm_atom_add_gen_i:
   case NVPTX::BI__nvvm_atom_add_gen_l:
   case NVPTX::BI__nvvm_atom_add_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Add, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_sub_gen_i:
   case NVPTX::BI__nvvm_atom_sub_gen_l:
   case NVPTX::BI__nvvm_atom_sub_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Sub, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_and_gen_i:
   case NVPTX::BI__nvvm_atom_and_gen_l:
   case NVPTX::BI__nvvm_atom_and_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::And, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_or_gen_i:
   case NVPTX::BI__nvvm_atom_or_gen_l:
   case NVPTX::BI__nvvm_atom_or_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Or, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_xor_gen_i:
   case NVPTX::BI__nvvm_atom_xor_gen_l:
   case NVPTX::BI__nvvm_atom_xor_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Xor, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_xchg_gen_i:
   case NVPTX::BI__nvvm_atom_xchg_gen_l:
   case NVPTX::BI__nvvm_atom_xchg_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicXchg(*this, expr, cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_max_gen_i:
   case NVPTX::BI__nvvm_atom_max_gen_l:
   case NVPTX::BI__nvvm_atom_max_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Max, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_max_gen_ui:
   case NVPTX::BI__nvvm_atom_max_gen_ul:
   case NVPTX::BI__nvvm_atom_max_gen_ull:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Max, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_min_gen_i:
   case NVPTX::BI__nvvm_atom_min_gen_l:
   case NVPTX::BI__nvvm_atom_min_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Min, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_min_gen_ui:
   case NVPTX::BI__nvvm_atom_min_gen_ul:
   case NVPTX::BI__nvvm_atom_min_gen_ull:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::Min, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_cas_gen_us:
   case NVPTX::BI__nvvm_atom_cas_gen_i:
   case NVPTX::BI__nvvm_atom_cas_gen_l:
   case NVPTX::BI__nvvm_atom_cas_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
-    // success flag.
+    return emitAtomicCmpXchg(expr, /*returnBool=*/false, cir::MemOrder::Relaxed,
+                             cir::MemOrder::Relaxed,
+                             cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_add_gen_f:
   case NVPTX::BI__nvvm_atom_add_gen_d:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Add,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_inc_gen_ui:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::UIncWrap, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_atom_dec_gen_ui:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeBinaryAtomicValue(cir::AtomicFetchKind::UDecWrap, expr,
+                                 /*originalArgType=*/nullptr,
+                                 /*emittedArgValue=*/nullptr,
+                                 cir::MemOrder::Relaxed);
   case NVPTX::BI__nvvm_ldg_c:
   case NVPTX::BI__nvvm_ldg_sc:
   case NVPTX::BI__nvvm_ldg_c2:
@@ -165,10 +239,7 @@ CIRGenFunction::emitNVPTXBuiltinExpr(unsigned builtinId, const CallExpr *expr) {
   case NVPTX::BI__nvvm_ldg_f4:
   case NVPTX::BI__nvvm_ldg_d:
   case NVPTX::BI__nvvm_ldg_d2:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeLdg(*this, expr);
   case NVPTX::BI__nvvm_ldu_c:
   case NVPTX::BI__nvvm_ldu_sc:
   case NVPTX::BI__nvvm_ldu_c2:
@@ -198,177 +269,127 @@ CIRGenFunction::emitNVPTXBuiltinExpr(unsigned builtinId, const CallExpr *expr) {
   case NVPTX::BI__nvvm_ldu_ul2:
   case NVPTX::BI__nvvm_ldu_ull:
   case NVPTX::BI__nvvm_ldu_ull2:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeLdu(*this, expr, "nvvm.ldu.global.i");
   case NVPTX::BI__nvvm_ldu_f:
   case NVPTX::BI__nvvm_ldu_f2:
   case NVPTX::BI__nvvm_ldu_f4:
   case NVPTX::BI__nvvm_ldu_d:
   case NVPTX::BI__nvvm_ldu_d2:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeLdu(*this, expr, "nvvm.ldu.global.f");
   case NVPTX::BI__nvvm_atom_cta_add_gen_i:
   case NVPTX::BI__nvvm_atom_cta_add_gen_l:
   case NVPTX::BI__nvvm_atom_cta_add_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Add,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_add_gen_i:
   case NVPTX::BI__nvvm_atom_sys_add_gen_l:
   case NVPTX::BI__nvvm_atom_sys_add_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Add,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_add_gen_f:
   case NVPTX::BI__nvvm_atom_cta_add_gen_d:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Add,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_add_gen_f:
   case NVPTX::BI__nvvm_atom_sys_add_gen_d:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Add,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_xchg_gen_i:
   case NVPTX::BI__nvvm_atom_cta_xchg_gen_l:
   case NVPTX::BI__nvvm_atom_cta_xchg_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicXchg(*this, expr, cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_xchg_gen_i:
   case NVPTX::BI__nvvm_atom_sys_xchg_gen_l:
   case NVPTX::BI__nvvm_atom_sys_xchg_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicXchg(*this, expr, cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_max_gen_i:
   case NVPTX::BI__nvvm_atom_cta_max_gen_ui:
   case NVPTX::BI__nvvm_atom_cta_max_gen_l:
   case NVPTX::BI__nvvm_atom_cta_max_gen_ul:
   case NVPTX::BI__nvvm_atom_cta_max_gen_ll:
   case NVPTX::BI__nvvm_atom_cta_max_gen_ull:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Max,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_max_gen_i:
   case NVPTX::BI__nvvm_atom_sys_max_gen_ui:
   case NVPTX::BI__nvvm_atom_sys_max_gen_l:
   case NVPTX::BI__nvvm_atom_sys_max_gen_ul:
   case NVPTX::BI__nvvm_atom_sys_max_gen_ll:
   case NVPTX::BI__nvvm_atom_sys_max_gen_ull:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Max,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_min_gen_i:
   case NVPTX::BI__nvvm_atom_cta_min_gen_ui:
   case NVPTX::BI__nvvm_atom_cta_min_gen_l:
   case NVPTX::BI__nvvm_atom_cta_min_gen_ul:
   case NVPTX::BI__nvvm_atom_cta_min_gen_ll:
   case NVPTX::BI__nvvm_atom_cta_min_gen_ull:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Min,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_min_gen_i:
   case NVPTX::BI__nvvm_atom_sys_min_gen_ui:
   case NVPTX::BI__nvvm_atom_sys_min_gen_l:
   case NVPTX::BI__nvvm_atom_sys_min_gen_ul:
   case NVPTX::BI__nvvm_atom_sys_min_gen_ll:
   case NVPTX::BI__nvvm_atom_sys_min_gen_ull:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Min,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_inc_gen_ui:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::UIncWrap,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_cta_dec_gen_ui:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::UDecWrap,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_inc_gen_ui:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::UIncWrap,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_sys_dec_gen_ui:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::UDecWrap,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_and_gen_i:
   case NVPTX::BI__nvvm_atom_cta_and_gen_l:
   case NVPTX::BI__nvvm_atom_cta_and_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::And,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_and_gen_i:
   case NVPTX::BI__nvvm_atom_sys_and_gen_l:
   case NVPTX::BI__nvvm_atom_sys_and_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::And,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_or_gen_i:
   case NVPTX::BI__nvvm_atom_cta_or_gen_l:
   case NVPTX::BI__nvvm_atom_cta_or_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Or,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_or_gen_i:
   case NVPTX::BI__nvvm_atom_sys_or_gen_l:
   case NVPTX::BI__nvvm_atom_sys_or_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Or,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_xor_gen_i:
   case NVPTX::BI__nvvm_atom_cta_xor_gen_l:
   case NVPTX::BI__nvvm_atom_cta_xor_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Xor,
+                               cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_xor_gen_i:
   case NVPTX::BI__nvvm_atom_sys_xor_gen_l:
   case NVPTX::BI__nvvm_atom_sys_xor_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeScopedAtomicRMW(*this, expr, cir::AtomicFetchKind::Xor,
+                               cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_atom_cta_cas_gen_us:
   case NVPTX::BI__nvvm_atom_cta_cas_gen_i:
   case NVPTX::BI__nvvm_atom_cta_cas_gen_l:
   case NVPTX::BI__nvvm_atom_cta_cas_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return emitAtomicCmpXchg(expr, /*returnBool=*/false, cir::MemOrder::Relaxed,
+                             cir::MemOrder::Relaxed,
+                             cir::SyncScopeKind::Workgroup);
   case NVPTX::BI__nvvm_atom_sys_cas_gen_us:
   case NVPTX::BI__nvvm_atom_sys_cas_gen_i:
   case NVPTX::BI__nvvm_atom_sys_cas_gen_l:
   case NVPTX::BI__nvvm_atom_sys_cas_gen_ll:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return emitAtomicCmpXchg(expr, /*returnBool=*/false, cir::MemOrder::Relaxed,
+                             cir::MemOrder::Relaxed,
+                             cir::SyncScopeKind::System);
   case NVPTX::BI__nvvm_match_all_sync_i32p:
   case NVPTX::BI__nvvm_match_all_sync_i64p:
     cgm.errorNYI(expr->getSourceRange(),
@@ -809,10 +830,7 @@ CIRGenFunction::emitNVPTXBuiltinExpr(unsigned builtinId, const CallExpr *expr) {
     return mlir::Value{};
   case NVPTX::BI__nvvm_ldu_h:
   case NVPTX::BI__nvvm_ldu_h2:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return makeLdu(*this, expr, "nvvm.ldu.global.f");
   case NVPTX::BI__nvvm_cp_async_ca_shared_global_4:
     cgm.errorNYI(expr->getSourceRange(),
                  std::string("unimplemented NVPTX builtin call: ") +
@@ -990,20 +1008,16 @@ CIRGenFunction::emitNVPTXBuiltinExpr(unsigned builtinId, const CallExpr *expr) {
         mlir::ValueRange{emitScalarExpr(expr->getArg(0)),
                          emitScalarExpr(expr->getArg(1))});
   case NVPTX::BI__nvvm_bar0_and:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return emitBar0Reduction(*this, expr,
+                             "nvvm.barrier.cta.red.and.aligned.all",
+                             /*returnsPred=*/true);
   case NVPTX::BI__nvvm_bar0_or:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return emitBar0Reduction(*this, expr, "nvvm.barrier.cta.red.or.aligned.all",
+                             /*returnsPred=*/true);
   case NVPTX::BI__nvvm_bar0_popc:
-    cgm.errorNYI(expr->getSourceRange(),
-                 std::string("unimplemented NVPTX builtin call: ") +
-                     getContext().BuiltinInfo.getName(builtinId));
-    return mlir::Value{};
+    return emitBar0Reduction(*this, expr,
+                             "nvvm.barrier.cta.red.popc.aligned.all",
+                             /*returnsPred=*/false);
 
   default:
     return std::nullopt;
@@ -1052,7 +1066,8 @@ static mlir::Value packArgsIntoNVPTXFormatBuffer(CIRGenFunction &cgf,
   // We can directly store the arguments into a struct, and the alignment
   // would automatically be correct. That's because vprintf does not
   // accept aggregates.
-  mlir::Type allocaTy = builder.getAnonRecordTy(argTypes);
+  mlir::Type allocaTy = builder.getAnonRecordTy(
+      argTypes, /*packed=*/false, cir::RecordType::getAllDataKinds(argTypes));
   auto allocaAlign = clang::CharUnits::fromQuantity(
       dataLayout.getABITypeAlign(allocaTy).value());
   Address allocaAddr =
@@ -1067,6 +1082,7 @@ static mlir::Value packArgsIntoNVPTXFormatBuffer(CIRGenFunction &cgf,
         dataLayout.getABITypeAlign(argTypes[i]).value());
     cir::StoreOp::create(builder, loc, arg.getKnownRValue().getValue(), member,
                          /*is_volatile=*/false,
+                         /*isNontemporal=*/false,
                          builder.getAlignmentAttr(abiAlign),
                          /*sync_scope=*/cir::SyncScopeKindAttr{},
                          /*mem_order=*/cir::MemOrderAttr{});
