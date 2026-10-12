@@ -2878,6 +2878,7 @@ std::optional<SpecificCall> IntrinsicInterface::Match(
     if (intrinsicClass == IntrinsicClass::pureSubroutine /* MOVE_ALLOC */) {
       // F2023 16.9.147 p2: MOVE_ALLOC is simple if and only if FROM is not a
       // coarray
+      // F2023 16.1 p5: No other standard intrinsic subroutine is pure or simple
       if (!IsCoarray(*rearranged[0])) {
         attrs.set(characteristics::Procedure::Attr::Simple);
         attrs.set(characteristics::Procedure::Attr::Pure);
